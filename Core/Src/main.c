@@ -68,6 +68,8 @@ QSPI_HandleTypeDef hqspi;
 SAI_HandleTypeDef hsai_BlockA1;
 
 SD_HandleTypeDef hsd;
+DMA_HandleTypeDef hdma_sdio_rx;
+DMA_HandleTypeDef hdma_sdio_tx;
 
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
@@ -151,18 +153,18 @@ void StartFFTTask(void *argument);
 /* USER CODE BEGIN 0 */
 
 // SEND PRINTF TO UART BEGIN
-//	int _write(int fd, char *ptr, int len) {
-//		HAL_StatusTypeDef hstatus;
-//
-//		if (fd == 1 || fd == 2) {
-//			hstatus = HAL_UART_Transmit(&huart3, (uint8_t*) ptr, len, HAL_MAX_DELAY);
-//			if (hstatus == HAL_OK)
-//				return len;
-//			else
-//				return -1;
-//		}
-//		return -1;
-//	}
+	int _write(int fd, char *ptr, int len) {
+		HAL_StatusTypeDef hstatus;
+
+		if (fd == 1 || fd == 2) {
+			hstatus = HAL_UART_Transmit(&huart3, (uint8_t*) ptr, len, HAL_MAX_DELAY);
+			if (hstatus == HAL_OK)
+				return len;
+			else
+				return -1;
+		}
+		return -1;
+	}
 // SEND PRINTF TO UART END
 
 
@@ -874,9 +876,18 @@ static void MX_SDIO_SD_Init(void)
   hsd.Init.ClockPowerSave = SDIO_CLOCK_POWER_SAVE_DISABLE;
   hsd.Init.BusWide = SDIO_BUS_WIDE_4B;
   hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
-  hsd.Init.ClockDiv = 0;
+  hsd.Init.ClockDiv = 2;
   /* USER CODE BEGIN SDIO_Init 2 */
+  // First init with 1B bus - SD card will not initialize with 4 bits
+  hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
+  if (HAL_SD_Init(&hsd) != HAL_OK) {
+      Error_Handler();
+  }
 
+  // Now we can switch to 4 bit mode
+  if (HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_4B) != HAL_OK) {
+      Error_Handler();
+  }
   /* USER CODE END SDIO_Init 2 */
 
 }
@@ -1058,6 +1069,12 @@ static void MX_DMA_Init(void)
   /* DMA2_Stream0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+  /* DMA2_Stream3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
+  /* DMA2_Stream6_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream6_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream6_IRQn);
 
 }
 
@@ -1259,7 +1276,8 @@ void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc) {
 	for (int n = 0; n < halfN; n++) {
 		dac_buffer[n] = adc_buffer[n];
 	}
-	osSemaphoreRelease(ADCHalfSemHandle);
+  	osSemaphoreRelease(FFTHalfSemHandle);
+//	osSemaphoreRelease(ADCHalfSemHandle);
 
 }
 
@@ -1267,7 +1285,8 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
 	for (int n = halfN; n < N; n++) {
 		dac_buffer[n] = adc_buffer[n];
 	}
-	osSemaphoreRelease(ADCFullSemHandle);
+  	osSemaphoreRelease(FFTFullSemHandle);
+//	osSemaphoreRelease(ADCFullSemHandle);
 
 }
 /* USER CODE END 4 */
@@ -1289,44 +1308,51 @@ void StartDefaultTask(void *argument)
 	HAL_ADC_Start_DMA(&hadc1, (uint32_t*) adc_buffer, N);
 //	HAL_DAC_Start_DMA(&hdac, DAC_CHANNEL_1, (uint32_t*) dac_buffer, N, DAC_ALIGN_12B_R);
 
+	/* SDCARD STUFF */
+	printf("SD Card Information:\r\n");
+	printf("Block size  : %lu\r\n", hsd.SdCard.BlockSize);
+	printf("Block nmbr  : %lu\r\n", hsd.SdCard.BlockNbr);
+	printf("Card size   : %lu\r\n", (hsd.SdCard.BlockSize * hsd.SdCard.BlockNbr) / 1000);
+	printf("Card version: %lu\r\n", hsd.SdCard.CardVersion);
+
 	/* Infinite loop */
 	for (;;) {
 
-    if (osSemaphoreAcquire(ADCHalfSemHandle, osWaitForever) == osOK) {
-      // Create a temporary transmit buffer for the first half.
-      // Size = number of ADC samples + 1 sync marker (each sample is 16 bits)
-      uint16_t tx_buffer_half[halfN + 1];
-      tx_buffer_half[0] = SYNC_MARKER; // Insert sync marker at the beginning.
-      // Copy half-buffer ADC data after the marker.
-      memcpy(&tx_buffer_half[1], dac_buffer, halfN * sizeof(uint16_t));
+//    if (osSemaphoreAcquire(ADCHalfSemHandle, osWaitForever) == osOK) {
+//      // Create a temporary transmit buffer for the first half.
+//      // Size = number of ADC samples + 1 sync marker (each sample is 16 bits)
+//      uint16_t tx_buffer_half[halfN + 1];
+//      tx_buffer_half[0] = SYNC_MARKER; // Insert sync marker at the beginning.
+//      // Copy half-buffer ADC data after the marker.
+//      memcpy(&tx_buffer_half[1], dac_buffer, halfN * sizeof(uint16_t));
+//
+//      // Transmit the sync marker + data block.
+//      if (HAL_UART_GetState(&huart3) == HAL_UART_STATE_READY) {
+//		  if (HAL_UART_Transmit_DMA(&huart3, (uint8_t*)tx_buffer_half, (halfN + 1) * sizeof(uint16_t)) != HAL_OK) {
+//			// Handle transmission error
+//			Error_Handler();
+//		  }
+//      }
+//
+//    }
 
-      // Transmit the sync marker + data block.
-      if (HAL_UART_GetState(&huart3) == HAL_UART_STATE_READY) {
-		  if (HAL_UART_Transmit_DMA(&huart3, (uint8_t*)tx_buffer_half, (halfN + 1) * sizeof(uint16_t)) != HAL_OK) {
-			// Handle transmission error
-			Error_Handler();
-		  }
-      }
-  	osSemaphoreRelease(FFTHalfSemHandle);
-    }
-
-    if (osSemaphoreAcquire(ADCFullSemHandle, osWaitForever) == osOK) {
-      // Create a temporary transmit buffer for the second half.
-      uint16_t tx_buffer_full[(N - halfN) + 1];
-      tx_buffer_full[0] = SYNC_MARKER; // Insert sync marker.
-      // Copy the second half of the ADC buffer.
-      memcpy(&tx_buffer_full[1], &dac_buffer[halfN], (N - halfN) * sizeof(uint16_t));
-
-      // Transmit the sync marker + data block.
-      if (HAL_UART_GetState(&huart3) == HAL_UART_STATE_READY){
-		  if (HAL_UART_Transmit_DMA(&huart3, (uint8_t*)tx_buffer_full, ((N - halfN) + 1) * sizeof(uint16_t)) != HAL_OK) {
-			// Handle transmission error
-			Error_Handler();
-		  }
-      }
-  	osSemaphoreRelease(FFTFullSemHandle);
-    }
-//		osDelay(1);
+//    if (osSemaphoreAcquire(ADCFullSemHandle, osWaitForever) == osOK) {
+//      // Create a temporary transmit buffer for the second half.
+//      uint16_t tx_buffer_full[(N - halfN) + 1];
+//      tx_buffer_full[0] = SYNC_MARKER; // Insert sync marker.
+//      // Copy the second half of the ADC buffer.
+//      memcpy(&tx_buffer_full[1], &dac_buffer[halfN], (N - halfN) * sizeof(uint16_t));
+//
+//      // Transmit the sync marker + data block.
+//      if (HAL_UART_GetState(&huart3) == HAL_UART_STATE_READY){
+//		  if (HAL_UART_Transmit_DMA(&huart3, (uint8_t*)tx_buffer_full, ((N - halfN) + 1) * sizeof(uint16_t)) != HAL_OK) {
+//			// Handle transmission error
+//			Error_Handler();
+//		  }
+//      }
+//
+//    }
+		osDelay(10);
 }
   /* USER CODE END 5 */
 }
@@ -1358,6 +1384,8 @@ void StartFFTTask(void *argument)
         hann_window[i] = 0.5 - 0.5 * cosf(2 * PI * i / (N - 1));  // Compute Hann window
     }
 
+    uint32_t now=uwTick;
+
   /* Infinite loop */
   for(;;)
   {
@@ -1388,6 +1416,11 @@ void StartFFTTask(void *argument)
 			  }
 		  }
 		  peakHz=peakIndex * (10000.0f / N);  // ✅ Correct frequency conversion
+	  }
+
+	  if (uwTick > now+1000){
+		  printf("Test\r\n");
+		  now=uwTick;
 	  }
   }
   /* USER CODE END StartFFTTask */
